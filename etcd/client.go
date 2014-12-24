@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strings"
 	"time"
 )
 
@@ -37,8 +38,8 @@ type Config struct {
 }
 
 type Client struct {
-	config      Config   `json:"config"`
-	cluster     *Cluster `json:"cluster"`
+	config      Config `json:"config"`
+	cluster     AtomicCluster
 	httpClient  *http.Client
 	persistence io.Writer
 	cURLch      chan string
@@ -69,10 +70,10 @@ func NewClient(machines []string) *Client {
 	}
 
 	client := &Client{
-		cluster: NewCluster(machines),
-		config:  config,
+		config: config,
 	}
 
+	client.cluster.set(NewCluster(machines))
 	client.initHTTPClient()
 	client.saveConfig()
 
@@ -97,10 +98,10 @@ func NewTLSClient(machines []string, cert, key, caCert string) (*Client, error) 
 	}
 
 	client := &Client{
-		cluster: NewCluster(machines),
-		config:  config,
+		config: config,
 	}
 
+	client.cluster.set(NewCluster(machines))
 	err := client.initHTTPSClient(cert, key)
 	if err != nil {
 		return nil, err
@@ -276,17 +277,16 @@ func (c *Client) AddRootCA(caCert string) error {
 
 // SetCluster updates cluster information using the given machine list.
 func (c *Client) SetCluster(machines []string) bool {
-	success := c.internalSyncCluster(machines)
-	return success
+	return c.internalSyncCluster(machines)
 }
 
 func (c *Client) GetCluster() []string {
-	return c.cluster.Machines
+	return c.cluster.get().Machines
 }
 
 // SyncCluster updates the cluster information using the internal machine list.
 func (c *Client) SyncCluster() bool {
-	return c.internalSyncCluster(c.cluster.Machines)
+	return c.internalSyncCluster(c.cluster.get().Machines)
 }
 
 // internalSyncCluster syncs cluster information using the given machine list.
@@ -305,14 +305,10 @@ func (c *Client) internalSyncCluster(machines []string) bool {
 				continue
 			}
 
-			// update Machines List
-			c.cluster.updateFromStr(string(b))
+			// update Cluster
+			c.cluster.set(NewCluster(strings.Split(string(b), ", ")))
 
-			// update leader
-			// the first one in the machine list is the leader
-			c.cluster.switchLeader(0)
-
-			logger.Debug("sync.machines ", c.cluster.Machines)
+			logger.Debug("sync.machines ", c.cluster.get().Machines)
 			c.saveConfig()
 			return true
 		}
@@ -407,7 +403,7 @@ func (c *Client) MarshalJSON() ([]byte, error) {
 		Cluster *Cluster `json:"cluster"`
 	}{
 		Config:  c.config,
-		Cluster: c.cluster,
+		Cluster: c.cluster.get(),
 	})
 
 	if err != nil {
@@ -429,7 +425,7 @@ func (c *Client) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
-	c.cluster = temp.Cluster
+	c.cluster.set(temp.Cluster)
 	c.config = temp.Config
 	return nil
 }

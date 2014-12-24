@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -39,7 +40,7 @@ func NewRawRequest(method, relativePath string, values url.Values, cancel <-chan
 // getCancelable issues a cancelable GET request
 func (c *Client) getCancelable(key string, options Options,
 	cancel <-chan bool) (*RawResponse, error) {
-	logger.Debugf("get %s [%s]", key, c.cluster.Leader)
+	logger.Debugf("get %s [%s]", key, c.cluster.get().Leader)
 	p := keyToPath(key)
 
 	// If consistency level is set to STRONG, append
@@ -73,7 +74,7 @@ func (c *Client) get(key string, options Options) (*RawResponse, error) {
 func (c *Client) put(key string, value string, ttl uint64,
 	options Options) (*RawResponse, error) {
 
-	logger.Debugf("put %s, %s, ttl: %d, [%s]", key, value, ttl, c.cluster.Leader)
+	logger.Debugf("put %s, %s, ttl: %d, [%s]", key, value, ttl, c.cluster.get().Leader)
 	p := keyToPath(key)
 
 	str, err := options.toParameters(VALID_PUT_OPTIONS)
@@ -94,7 +95,7 @@ func (c *Client) put(key string, value string, ttl uint64,
 
 // post issues a POST request
 func (c *Client) post(key string, value string, ttl uint64) (*RawResponse, error) {
-	logger.Debugf("post %s, %s, ttl: %d, [%s]", key, value, ttl, c.cluster.Leader)
+	logger.Debugf("post %s, %s, ttl: %d, [%s]", key, value, ttl, c.cluster.get().Leader)
 	p := keyToPath(key)
 
 	req := NewRawRequest("POST", p, buildValues(value, ttl), nil)
@@ -109,7 +110,7 @@ func (c *Client) post(key string, value string, ttl uint64) (*RawResponse, error
 
 // delete issues a DELETE request
 func (c *Client) delete(key string, options Options) (*RawResponse, error) {
-	logger.Debugf("delete %s [%s]", key, c.cluster.Leader)
+	logger.Debugf("delete %s [%s]", key, c.cluster.get().Leader)
 	p := keyToPath(key)
 
 	str, err := options.toParameters(VALID_DELETE_OPTIONS)
@@ -138,11 +139,6 @@ func (c *Client) SendRequest(rr *RawRequest) (*RawResponse, error) {
 	var respBody []byte
 
 	var numReqs = 1
-
-	checkRetry := c.CheckRetry
-	if checkRetry == nil {
-		checkRetry = DefaultCheckRetry
-	}
 
 	cancelled := make(chan bool, 1)
 	reqLock := new(sync.Mutex)
@@ -260,11 +256,11 @@ func (c *Client) SendRequest(rr *RawRequest) (*RawResponse, error) {
 		if err != nil {
 			logger.Debug("network error: ", err.Error())
 			lastResp := http.Response{}
-			if checkErr := checkRetry(c.cluster, numReqs, lastResp, err); checkErr != nil {
+			if checkErr := c.DoCheckRetry(numReqs, lastResp, err); checkErr != nil {
 				return nil, checkErr
 			}
 
-			c.cluster.switchLeader(attempt % len(c.cluster.Machines))
+			c.cluster.switchLeader(attempt)
 			continue
 		}
 
@@ -311,7 +307,7 @@ func (c *Client) SendRequest(rr *RawRequest) (*RawResponse, error) {
 			continue
 		}
 
-		if checkErr := checkRetry(c.cluster, numReqs, *resp,
+		if checkErr := c.DoCheckRetry(numReqs, *resp,
 			errors.New("Unexpected HTTP status code")); checkErr != nil {
 			return nil, checkErr
 		}
@@ -348,12 +344,31 @@ func DefaultCheckRetry(cluster *Cluster, numReqs int, lastResp http.Response,
 	return nil
 }
 
+func (c *Client) DoCheckRetry(numReqs int, lastResp http.Response, err error) error {
+	checkRetry := c.CheckRetry
+	if checkRetry == nil {
+		checkRetry = DefaultCheckRetry
+	}
+
+	old := c.cluster.get()
+	clone := old.Clone()
+	checkErr := checkRetry(clone, numReqs, lastResp, err)
+	if err == nil && !reflect.DeepEqual(old, clone) {
+		//apply copy only callback do modification and cluster is not modify else where
+		//modification base on old value make no sense, and must be discarded
+		//swapping in unmodified clone will add pressure to GC system, avoid it
+		c.cluster.cas(old, clone)
+	}
+	return checkErr
+}
+
 func (c *Client) getHttpPath(random bool, s ...string) string {
 	var machine string
+	cluster := c.cluster.get()
 	if random {
-		machine = c.cluster.Machines[rand.Intn(len(c.cluster.Machines))]
+		machine = cluster.Machines[rand.Intn(len(cluster.Machines))]
 	} else {
-		machine = c.cluster.Leader
+		machine = cluster.Leader
 	}
 
 	fullPath := machine + "/" + version
